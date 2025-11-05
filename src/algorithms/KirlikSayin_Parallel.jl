@@ -144,68 +144,75 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
             status = ret
             break
         end
-        max_volume_index = argmax([_volume(Rᵢ, _project(yI, k)) for Rᵢ in L])
-        uᵢ = L[max_volume_index].u
-        # Solving the first stage model: P_k(ε)
-        #   minimize: f_1(x)
-        #       s.t.: f_i(x) <= u_i - δ
-        @assert k == 1
-        MOI.set(
-            model.inner,
-            MOI.ObjectiveFunction{typeof(scalars[k])}(),
-            scalars[k],
-        )
-        ε_constraints = Any[]
-        for (i, f_i) in enumerate(scalars)
-            if i == k
-                continue
-            end
-            ci = MOI.Utilities.normalize_and_add_constraint(
-                model.inner,
-                f_i,
-                MOI.LessThan{Float64}(uᵢ[i-1] - δ),
-            )
-            push!(ε_constraints, ci)
-        end
-        optimize_inner!(model)
-        if !_is_scalar_status_optimal(model)
-            # If this fails, it likely means that the solver experienced a
-            # numerical error with this box. Just skip it.
-            _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
-            MOI.delete.(model, ε_constraints)
-            continue
-        end
-        zₖ = MOI.get(model.inner, MOI.ObjectiveValue())
-        # Solving the second stage model: Q_k(ε, zₖ)
-        # Set objective sum(model.f)
-        sum_f = MOI.Utilities.operate(+, Float64, scalars...)
-        MOI.set(model.inner, MOI.ObjectiveFunction{typeof(sum_f)}(), sum_f)
-        # Constraint to eliminate weak dominance
-        zₖ_constraint = MOI.Utilities.normalize_and_add_constraint(
-            model.inner,
-            scalars[k],
-            MOI.EqualTo(zₖ),
-        )
-        optimize_inner!(model)
-        if !_is_scalar_status_optimal(model)
-            # If this fails, it likely means that the solver experienced a
-            # numerical error with this box. Just skip it.
-            MOI.delete.(model, ε_constraints)
-            MOI.delete(model, zₖ_constraint)
-            _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
-            continue
-        end
-        X, Y = _compute_point(model, variables, model.f)
-        Y_proj = _project(Y, k)
-        if !(Y in YN)
-            push!(solutions, SolutionPoint(X, Y))
-            push!(YN, Y)
-            L = _update_list(L, Y_proj)
-        end
-        MOI.delete(model, zₖ_constraint)
-        MOI.delete.(model, ε_constraints)
-        _remove_RectangleParallel(L, _RectangleParallel(Y_proj, uᵢ))
 
+        volumns_to_grap = min(LShared.length, Distributed.nworkers())
+        max_volume_indexs = sort(collect(1:length(L)), by = i -> _volume(L[i], _project(yI, k)), rev = true)[1:volumns_to_grap]
+
+        result = Distributed.pmap(max_volume_index -> begin 
+            uᵢ = LShared[max_volume_index].u
+            local_model = rebuild_model(model)
+
+            # Solving the first stage model: P_k(ε)
+            #   minimize: f_1(x)
+            #       s.t.: f_i(x) <= u_i - δ
+            @assert k == 1
+            MOI.set(
+                local_model.inner,
+                MOI.ObjectiveFunction{typeof(scalars[k])}(),
+                scalars[k],
+            )
+            ε_constraints = Any[]
+            for (i, f_i) in enumerate(scalars)
+                if i == k
+                    continue
+                end
+                ci = MOI.Utilities.normalize_and_add_constraint(
+                    local_model.inner,
+                    f_i,
+                    MOI.LessThan{Float64}(uᵢ[i-1] - δ),
+                )
+                push!(ε_constraints, ci)
+            end
+            optimize_inner!(local_model)
+            if !_is_scalar_status_optimal(local_model)
+                # If this fails, it likely means that the solver experienced a
+                # numerical error with this box. Just skip it.
+                _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
+                MOI.delete.(local_model, ε_constraints)
+                return nothing
+            end
+            zₖ = MOI.get(local_model.inner, MOI.ObjectiveValue())
+            # Solving the second stage local_model: Q_k(ε, zₖ)
+            # Set objective sum(local_model.f)
+            sum_f = MOI.Utilities.operate(+, Float64, scalars...)
+            MOI.set(local_model.inner, MOI.ObjectiveFunction{typeof(sum_f)}(), sum_f)
+            # Constraint to eliminate weak dominance
+            zₖ_constraint = MOI.Utilities.normalize_and_add_constraint(
+                local_model.inner,
+                scalars[k],
+                MOI.EqualTo(zₖ),
+            )
+            optimize_inner!(local_model)
+            if !_is_scalar_status_optimal(local_model)
+                # If this fails, it likely means that the solver experienced a
+                # numerical error with this box. Just skip it.
+                MOI.delete.(local_model, ε_constraints)
+                MOI.delete(local_model, zₖ_constraint)
+                _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
+                return nothing
+            end
+            X, Y = _compute_point(local_model, variables, local_model.f)
+            Y_proj = _project(Y, k)
+            if !(Y in YN)
+                push!(solutions, SolutionPoint(X, Y))
+                push!(YN, Y)
+                L = _update_list(L, Y_proj)
+            end
+            MOI.delete(local_model, zₖ_constraint)
+            MOI.delete.(local_model, ε_constraints)
+            _remove_RectangleParallel(L, _RectangleParallel(Y_proj, uᵢ))
+    
+    end, max_volume_indexs)
 
     end
     return status, filter_nondominated(MOI.MIN_SENSE, solutions)
