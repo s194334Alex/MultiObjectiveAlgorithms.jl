@@ -24,45 +24,45 @@ is solved for each rectangle.
 """
 struct KirlikSayinParallel <: AbstractAlgorithm end
 
-struct _Rectangle
+struct _RectangleParallel
     l::Vector{Float64}
     u::Vector{Float64}
 
-    function _Rectangle(l::Vector{Float64}, u::Vector{Float64})
+    function _RectangleParallel(l::Vector{Float64}, u::Vector{Float64})
         @assert length(l) == length(u) "Dimension mismatch between l and u"
         return new(l, u)
     end
 end
 
-_volume(r::_Rectangle, l::Vector{Float64}) = prod(r.u - l)
+_volume(r::_RectangleParallel, l::Vector{Float64}) = prod(r.u - l)
 
-function Base.issubset(x::_Rectangle, y::_Rectangle)
+function Base.issubset(x::_RectangleParallel, y::_RectangleParallel)
     @assert length(x.l) == length(y.l) "Dimension mismatch"
     return all(x.l .>= y.l) && all(x.u .<= y.u)
 end
 
-function _remove_rectangle(L::Vector{_Rectangle}, R::_Rectangle)
+function _remove_RectangleParallel(L::Vector{_RectangleParallel}, R::_RectangleParallel)
     index_to_remove = Int[t for (t, x) in enumerate(L) if issubset(x, R)]
     deleteat!(L, index_to_remove)
     return
 end
 
-function _split_rectangle(r::_Rectangle, axis::Int, f::Float64)
+function _split_RectangleParallel(r::_RectangleParallel, axis::Int, f::Float64)
     l = [i != axis ? r.l[i] : f for i in 1:length(r.l)]
     u = [i != axis ? r.u[i] : f for i in 1:length(r.l)]
-    return _Rectangle(r.l, u), _Rectangle(l, r.u)
+    return _RectangleParallel(r.l, u), _RectangleParallel(l, r.u)
 end
 
-function _update_list(L::Vector{_Rectangle}, f::Vector{Float64})
-    L_new = _Rectangle[]
+function _update_list(L::Vector{_RectangleParallel}, f::Vector{Float64})
+    L_new = _RectangleParallel[]
     for Rᵢ in L
         lᵢ, uᵢ = Rᵢ.l, Rᵢ.u
         T = [Rᵢ]
         for j in 1:length(f)
             if lᵢ[j] < f[j] < uᵢ[j]
-                T̄ = _Rectangle[]
+                T̄ = _RectangleParallel[]
                 for Rₜ in T
-                    a, b = _split_rectangle(Rₜ, j, f[j])
+                    a, b = _split_RectangleParallel(Rₜ, j, f[j])
                     push!(T̄, a)
                     push!(T̄, b)
                 end
@@ -74,11 +74,20 @@ function _update_list(L::Vector{_Rectangle}, f::Vector{Float64})
     return L_new
 end
 
-function minimize_multiobjective!(algorithm::KirlikSayin, model::Optimizer)
+function rebuild_model(model::Optimizer)::Optimizer
+    new_model = Optimizer(model.optimizer_factory)
+    MOI.copy_to(new_model, model.inner)
+    
+    # silent = MOI.get(model.inner, MOI.Silent())
+   MOI.set(new_model, MOI.Silent(), true)
+
+    return new_model
+end
+
+function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimizer)
     @assert MOI.get(model.inner, MOI.ObjectiveSense()) == MOI.MIN_SENSE
-    start_time = time()
-    solverThreads = MOI.get(model.inner, MOI.SolverThreads())
-    @assert solverThreads >= 1 "The inner solver must use atleast single thread."
+    start_time = time()    
+
     solutions = SolutionPoint[]
     # Problem with p objectives.
     # Set k = 1, meaning the nondominated points will get projected
@@ -87,36 +96,48 @@ function minimize_multiobjective!(algorithm::KirlikSayin, model::Optimizer)
     YN = Vector{Float64}[]
     variables = MOI.get(model.inner, MOI.ListOfVariableIndices())
     n = MOI.output_dimension(model.f)
-    yI, yN = zeros(n), zeros(n)
+    #yI, yN = zeros(n), zeros(n)
+    sharedIdealPoint = SharedArrays.SharedVector{Float64}(n)
+    yI = SharedArrays.SharedVector{Float64}(n)
+    yN = SharedArrays.SharedVector{Float64}(n)
     # This tolerance is really important!
     δ = 1.0
     scalars = MOI.Utilities.scalarize(model.f)
+
     # Ideal and Nadir point estimation
-    for (i, f_i) in enumerate(scalars)
+    results = Distributed.pmap(i -> begin
+        f_i = scalars[i]
+        local_model = rebuild_model(model)
+
         # Ideal point
-        MOI.set(model.inner, MOI.ObjectiveFunction{typeof(f_i)}(), f_i)
-        optimize_inner!(model)
-        status = MOI.get(model.inner, MOI.TerminationStatus())
+        MOI.set(local_model.inner, MOI.ObjectiveFunction{typeof(f_i)}(), f_i)
+        optimize_inner!(local_model)
+        status = MOI.get(local_model.inner, MOI.TerminationStatus())
         if !_is_scalar_status_optimal(status)
             return status, nothing
         end
-        _, Y = _compute_point(model, variables, f_i)
-        model.ideal_point[i] = yI[i] = Y
+        _, Y = _compute_point(local_model, variables, f_i)
+        sharedIdealPoint[i] = yI[i] = Y
+        
         # Nadir point
-        MOI.set(model.inner, MOI.ObjectiveSense(), MOI.MAX_SENSE)
-        optimize_inner!(model)
-        status = MOI.get(model.inner, MOI.TerminationStatus())
+        MOI.set(local_model.inner, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+        optimize_inner!(local_model)
+        status = MOI.get(local_model.inner, MOI.TerminationStatus())
         if !_is_scalar_status_optimal(status)
             # Repair ObjectiveSense before exiting
-            MOI.set(model.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+            MOI.set(local_model.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
             _warn_on_nonfinite_anti_ideal(algorithm, MOI.MIN_SENSE, i)
             return status, nothing
         end
-        _, Y = _compute_point(model, variables, f_i)
+        _, Y = _compute_point(local_model, variables, f_i)
         yN[i] = Y + δ
-        MOI.set(model.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
-    end
-    L = [_Rectangle(_project(yI, k), _project(yN, k))]
+        MOI.set(local_model.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+    end, 1:length(scalars))
+    
+    model.ideal_point = collect(sharedIdealPoint)
+    LShared = SharedArrays.SharedVector{_RectangleParallel}(1)
+    LShared[1] = _RectangleParallel(_project(yI, k), _project(yN, k))
+    L = [_RectangleParallel(_project(yI, k), _project(yN, k))]
     status = MOI.OPTIMAL
     while !isempty(L)
         if (ret = _check_premature_termination(model, start_time)) !== nothing
@@ -150,7 +171,7 @@ function minimize_multiobjective!(algorithm::KirlikSayin, model::Optimizer)
         if !_is_scalar_status_optimal(model)
             # If this fails, it likely means that the solver experienced a
             # numerical error with this box. Just skip it.
-            _remove_rectangle(L, _Rectangle(_project(yI, k), uᵢ))
+            _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
             MOI.delete.(model, ε_constraints)
             continue
         end
@@ -171,7 +192,7 @@ function minimize_multiobjective!(algorithm::KirlikSayin, model::Optimizer)
             # numerical error with this box. Just skip it.
             MOI.delete.(model, ε_constraints)
             MOI.delete(model, zₖ_constraint)
-            _remove_rectangle(L, _Rectangle(_project(yI, k), uᵢ))
+            _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
             continue
         end
         X, Y = _compute_point(model, variables, model.f)
@@ -181,9 +202,11 @@ function minimize_multiobjective!(algorithm::KirlikSayin, model::Optimizer)
             push!(YN, Y)
             L = _update_list(L, Y_proj)
         end
-        _remove_rectangle(L, _Rectangle(Y_proj, uᵢ))
-        MOI.delete.(model, ε_constraints)
         MOI.delete(model, zₖ_constraint)
+        MOI.delete.(model, ε_constraints)
+        _remove_RectangleParallel(L, _RectangleParallel(Y_proj, uᵢ))
+
+
     end
     return status, filter_nondominated(MOI.MIN_SENSE, solutions)
 end

@@ -7,6 +7,9 @@ module MultiObjectiveAlgorithms
 
 import Combinatorics
 import MathOptInterface as MOI
+import Distributed
+import SharedArrays
+import JuMP
 
 struct SolutionPoint
     x::Dict{MOI.VariableIndex,Float64}
@@ -776,7 +779,7 @@ function _warn_on_nonfinite_anti_ideal(algorithm, sense, index)
     return
 end
 
-function _project(x::Vector{Float64}, axis::Int)
+function _project(x::AbstractVector{Float64}, axis::Int)
     return [x[i] for i in 1:length(x) if i != axis]
 end
 
