@@ -22,6 +22,14 @@ end
 
 Base.:(==)(a::SolutionPoint, b::SolutionPoint) = a.y == b.y
 
+function copy(s::SolutionPoint)
+    return SolutionPoint(copy(s.x), copy(s.y))
+end
+
+function copy(solutions::Vector{SolutionPoint})
+    return [copy(s) for s in solutions]
+end
+
 """
     dominates(sense, a::SolutionPoint, b::SolutionPoint; atol::Float64)
 
@@ -147,6 +155,25 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
         )
     end
 end
+
+function copy(model::Optimizer)::Optimizer
+    new_model = Optimizer(model.optimizer_factory)
+    MOI.copy_to(new_model, model)
+    new_model.algorithm = model.algorithm
+    new_model.f = model.f
+    new_model.solutions = copy(model.solutions)
+    new_model.termination_status = model.termination_status
+    new_model.time_limit_sec = model.time_limit_sec
+    new_model.solve_time = model.solve_time
+    new_model.ideal_point = Base.copy(model.ideal_point)
+    new_model.compute_ideal_point = model.compute_ideal_point
+    new_model.subproblem_count = model.subproblem_count
+
+    MOI.set(new_model, MOI.TimeLimitSec(), model.time_limit_sec)
+    MOI.set(new_model, MOI.Silent(), true)
+    return new_model
+end
+    
 
 function MOI.empty!(model::Optimizer)
     MOI.empty!(model.inner)
@@ -620,7 +647,7 @@ function optimize_multiobjective!(
     if sense == MOI.FEASIBILITY_SENSE
         return MOI.INVALID_MODEL, nothing
     elseif sense == MOI.MAX_SENSE
-        old_obj = copy(model.f)
+        old_obj = MOI.copy(model.f)
         neg_obj = MOI.Utilities.operate(-, Float64, model.f)
         MOI.set(model, MOI.ObjectiveFunction{typeof(neg_obj)}(), neg_obj)
         MOI.set(model, MOI.ObjectiveSense(), MOI.MIN_SENSE)

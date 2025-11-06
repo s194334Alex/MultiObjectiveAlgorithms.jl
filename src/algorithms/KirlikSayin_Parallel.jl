@@ -24,6 +24,14 @@ is solved for each rectangle.
 """
 struct KirlikSayinParallel <: AbstractAlgorithm end
 
+struct KirlikSayinParallelInfo
+    scales::Vector{MOI.ScalarAffineFunction{Float64}}
+    model::Optimizer
+    start_time::Float64
+    variables::Vector{MOI.VariableIndex}
+    algorithm::KirlikSayinParallel
+end
+
 struct _RectangleParallel
     l::Vector{Float64}
     u::Vector{Float64}
@@ -77,11 +85,28 @@ end
 function rebuild_model(model::Optimizer)::Optimizer
     new_model = Optimizer(model.optimizer_factory)
     MOI.copy_to(new_model, model.inner)
+    new_model.f = model.f
     
-    # silent = MOI.get(model.inner, MOI.Silent())
-   MOI.set(new_model, MOI.Silent(), true)
+
+    MOI.set(new_model, MOI.Silent(), true)
 
     return new_model
+end
+
+function _distribute_info_to_workers!(info::KirlikSayinParallelInfo)
+    @assert Distributed.nprocs() > 1 "At least 2 processes are required for parallel execution"
+    for p in Distributed.workers()
+        Distributed.remotecall_fetch(p) do
+            global SCALARS = info.scales
+            global LOCAL_MODEL = copy(info.model)
+            global START_TIME = info.start_time
+            global K = 1
+            global δ = 1.0
+            global VARIABLES = info.variables
+            global ALGO = info.algorithm
+            return nothing
+        end
+    end
 end
 
 function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimizer)
@@ -104,39 +129,27 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
     δ = 1.0
     scalars = MOI.Utilities.scalarize(model.f)
 
-    # Ideal and Nadir point estimation
-    results = Distributed.pmap(i -> begin
-        f_i = scalars[i]
-        local_model = rebuild_model(model)
+    #Broadcast info to workers
+    parallel_info = KirlikSayinParallelInfo(scalars, model, start_time, variables, algorithm)
+    _distribute_info_to_workers!(parallel_info)
 
-        # Ideal point
-        MOI.set(local_model.inner, MOI.ObjectiveFunction{typeof(f_i)}(), f_i)
-        optimize_inner!(local_model)
-        status = MOI.get(local_model.inner, MOI.TerminationStatus())
-        if !_is_scalar_status_optimal(status)
-            return status, nothing
-        end
-        _, Y = _compute_point(local_model, variables, f_i)
-        sharedIdealPoint[i] = yI[i] = Y
-        
-        # Nadir point
-        MOI.set(local_model.inner, MOI.ObjectiveSense(), MOI.MAX_SENSE)
-        optimize_inner!(local_model)
-        status = MOI.get(local_model.inner, MOI.TerminationStatus())
-        if !_is_scalar_status_optimal(status)
-            # Repair ObjectiveSense before exiting
-            MOI.set(local_model.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
-            _warn_on_nonfinite_anti_ideal(algorithm, MOI.MIN_SENSE, i)
-            return status, nothing
-        end
-        _, Y = _compute_point(local_model, variables, f_i)
-        yN[i] = Y + δ
-        MOI.set(local_model.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
-    end, 1:length(scalars))
+    # Ideal and Nadir point estimation
+    results = Distributed.pmap(i -> begin 
+        # println("Computing ideal and nadir point for objective ", i)
+        res = process_ideal_nadir_point(i, yI, yN, sharedIdealPoint)
+        # println("Finished ideal and nadir point for objective ", i)
+        return res
+    end, 1:n)
     
+    # Check for errors during ideal/nadir point computation
+    if any(r -> typeof(r) !== Int64, results)
+        return findfirst(r -> typeof(r) !== Int64, results)
+    end
+    
+    # updating the model info
+    model.subproblem_count += sum(results)
     model.ideal_point = collect(sharedIdealPoint)
-    LShared = SharedArrays.SharedVector{_RectangleParallel}(1)
-    LShared[1] = _RectangleParallel(_project(yI, k), _project(yN, k))
+    
     L = [_RectangleParallel(_project(yI, k), _project(yN, k))]
     status = MOI.OPTIMAL
     while !isempty(L)
@@ -145,75 +158,205 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
             break
         end
 
-        volumns_to_grap = min(LShared.length, Distributed.nworkers())
-        max_volume_indexs = sort(collect(1:length(L)), by = i -> _volume(L[i], _project(yI, k)), rev = true)[1:volumns_to_grap]
+        volumes = [_volume(Rᵢ, _project(yI, k)) for Rᵢ in L]
+        selected_volumes_idx = partialsortperm(volumes, 1:min(Distributed.nworkers(), length(L)), rev=true)
+        selected_boxes = L[selected_volumes_idx]
+        
+        old_L_length = length(L)
+        #The parallel distributor
+        futures = Vector{Distributed.Future}(undef, length(selected_boxes))
+        for (idx, box) in enumerate(selected_boxes)
+            futures[idx] = Distributed.@spawnat Distributed.workers()[idx] begin
+                # println("\nStarted working on box:", box)
+                res = process_box(box)
+                # println("Finished working on box:", box)
+                return res
+            end
+        end
+        @assert length(L) == old_L_length "Length of L changed during parallel processing!"
 
-        result = Distributed.pmap(max_volume_index -> begin 
-            uᵢ = LShared[max_volume_index].u
-            local_model = rebuild_model(model)
-
-            # Solving the first stage model: P_k(ε)
-            #   minimize: f_1(x)
-            #       s.t.: f_i(x) <= u_i - δ
-            @assert k == 1
-            MOI.set(
-                local_model.inner,
-                MOI.ObjectiveFunction{typeof(scalars[k])}(),
-                scalars[k],
-            )
-            ε_constraints = Any[]
-            for (i, f_i) in enumerate(scalars)
-                if i == k
-                    continue
+        all_res = fetch.(futures)
+        for res in all_res
+            if res.should_remove
+                _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), res.box.u))
+            else
+                if !(res.Y in YN)
+                    push!(solutions, SolutionPoint(res.X, res.Y))
+                    push!(YN, res.Y)
+                    L = _update_list(L, res.Y_proj)
                 end
-                ci = MOI.Utilities.normalize_and_add_constraint(
-                    local_model.inner,
-                    f_i,
-                    MOI.LessThan{Float64}(uᵢ[i-1] - δ),
-                )
-                push!(ε_constraints, ci)
-            end
-            optimize_inner!(local_model)
-            if !_is_scalar_status_optimal(local_model)
-                # If this fails, it likely means that the solver experienced a
-                # numerical error with this box. Just skip it.
-                _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
-                MOI.delete.(local_model, ε_constraints)
-                return nothing
-            end
-            zₖ = MOI.get(local_model.inner, MOI.ObjectiveValue())
-            # Solving the second stage local_model: Q_k(ε, zₖ)
-            # Set objective sum(local_model.f)
-            sum_f = MOI.Utilities.operate(+, Float64, scalars...)
-            MOI.set(local_model.inner, MOI.ObjectiveFunction{typeof(sum_f)}(), sum_f)
-            # Constraint to eliminate weak dominance
-            zₖ_constraint = MOI.Utilities.normalize_and_add_constraint(
-                local_model.inner,
-                scalars[k],
-                MOI.EqualTo(zₖ),
-            )
-            optimize_inner!(local_model)
-            if !_is_scalar_status_optimal(local_model)
-                # If this fails, it likely means that the solver experienced a
-                # numerical error with this box. Just skip it.
-                MOI.delete.(local_model, ε_constraints)
-                MOI.delete(local_model, zₖ_constraint)
-                _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
-                return nothing
-            end
-            X, Y = _compute_point(local_model, variables, local_model.f)
-            Y_proj = _project(Y, k)
-            if !(Y in YN)
-                push!(solutions, SolutionPoint(X, Y))
-                push!(YN, Y)
-                L = _update_list(L, Y_proj)
-            end
-            MOI.delete(local_model, zₖ_constraint)
-            MOI.delete.(local_model, ε_constraints)
-            _remove_RectangleParallel(L, _RectangleParallel(Y_proj, uᵢ))
-    
-    end, max_volume_indexs)
+                _remove_RectangleParallel(L, _RectangleParallel(res.Y_proj, res.box.u))
+            end  
 
+            # Update subproblem count
+            model.subproblem_count += res.subproblems_solver         
+        end
     end
     return status, filter_nondominated(MOI.MIN_SENSE, solutions)
+end
+
+function process_ideal_nadir_point(i::Int, yI::SharedArrays.SharedVector{Float64}, yN::SharedArrays.SharedVector{Float64}, sharedIdealPoint::SharedArrays.SharedVector{Float64})
+    f_i = SCALARS[i]
+   
+    # Ideal point
+    MOI.set(LOCAL_MODEL.inner, MOI.ObjectiveFunction{typeof(f_i)}(), f_i)
+    optimize_inner!(LOCAL_MODEL)
+    status = MOI.get(LOCAL_MODEL.inner, MOI.TerminationStatus())
+    if !_is_scalar_status_optimal(status)
+        return status, nothing
+    end
+    _, Y = _compute_point(LOCAL_MODEL, VARIABLES, f_i)
+    sharedIdealPoint[i] = yI[i] = Y
+    
+    # Nadir point
+    MOI.set(LOCAL_MODEL.inner, MOI.ObjectiveSense(), MOI.MAX_SENSE)
+    optimize_inner!(LOCAL_MODEL)
+    status = MOI.get(LOCAL_MODEL.inner, MOI.TerminationStatus())
+    if !_is_scalar_status_optimal(status)
+        # Repair ObjectiveSense before exiting
+        MOI.set(LOCAL_MODEL.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+        _warn_on_nonfinite_anti_ideal(ALGO, MOI.MIN_SENSE, i)
+        return status, nothing
+    end
+
+    _, Y = _compute_point(LOCAL_MODEL, VARIABLES, f_i)
+    yN[i] = Y + δ
+    MOI.set(LOCAL_MODEL.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
+    return LOCAL_MODEL.subproblem_count
+end
+
+struct BoxProcessResult
+    should_remove::Bool
+    X::Union{Dict{MOI.VariableIndex,Float64}, Nothing}
+    Y::Union{Vector{Float64}, Nothing}
+    Y_proj::Union{Vector{Float64}, Nothing}
+    box::_RectangleParallel
+    subproblems_solver::Int64
+end
+
+function process_box(box::_RectangleParallel)::BoxProcessResult
+    uᵢ = box.u
+    # Solving the first stage model: P_k(ε)
+    #   minimize: f_1(x)
+    #       s.t.: f_i(x) <= u_i - δ
+    @assert K == 1
+    MOI.set(
+        LOCAL_MODEL.inner,
+        MOI.ObjectiveFunction{typeof(SCALARS[K])}(),
+        SCALARS[K],
+    )
+    ε_constraints = Any[]
+    for (i, f_i) in enumerate(SCALARS)
+        if i == K
+            continue
+        end
+        ci = MOI.Utilities.normalize_and_add_constraint(
+            LOCAL_MODEL.inner,
+            f_i,
+            MOI.LessThan{Float64}(uᵢ[i-1] - δ),
+        )
+        push!(ε_constraints, ci)
+    end
+    optimize_inner!(LOCAL_MODEL)
+    if !_is_scalar_status_optimal(LOCAL_MODEL)
+        # If this fails, it likely means that the solver experienced a
+        # numerical error with this box. Just skip it.
+        # _remove_RectangleParallel(L, _RectangleParallel(_project(yI, K), uᵢ))
+        MOI.delete.(LOCAL_MODEL, ε_constraints)
+        return BoxProcessResult(true, nothing, nothing, nothing, box, LOCAL_MODEL.subproblem_count)
+    end
+    zₖ = MOI.get(LOCAL_MODEL.inner, MOI.ObjectiveValue())
+    # Solving the second stage model: Q_k(ε, zₖ)
+    # Set objective sum(model.f)
+    sum_f = MOI.Utilities.operate(+, Float64, SCALARS...)
+    MOI.set(LOCAL_MODEL.inner, MOI.ObjectiveFunction{typeof(sum_f)}(), sum_f)
+    # Constraint to eliminate weak dominance
+    zₖ_constraint = MOI.Utilities.normalize_and_add_constraint(
+        LOCAL_MODEL.inner,
+        SCALARS[K],
+        MOI.EqualTo(zₖ),
+    )
+    optimize_inner!(LOCAL_MODEL)
+    if !_is_scalar_status_optimal(LOCAL_MODEL)
+        # If this fails, it likely means that the solver experienced a
+        # numerical error with this box. Just skip it.
+        MOI.delete.(LOCAL_MODEL, ε_constraints)
+        MOI.delete(LOCAL_MODEL, zₖ_constraint)
+        # _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
+        return BoxProcessResult(true, nothing, nothing, nothing, box, LOCAL_MODEL.subproblem_count)
+    end
+    X, Y = _compute_point(LOCAL_MODEL, VARIABLES, LOCAL_MODEL.f)
+    Y_proj = _project(Y, K)
+    #  _remove_RectangleParallel(L, _RectangleParallel(Y_proj, uᵢ))
+    MOI.delete.(LOCAL_MODEL, ε_constraints)
+    MOI.delete(LOCAL_MODEL, zₖ_constraint)
+    return BoxProcessResult(false, X, Y, Y_proj, box, LOCAL_MODEL.subproblem_count)
+end
+
+function old_code()
+    #region old code
+        max_volume_index = argmax([_volume(Rᵢ, _project(yI, k)) for Rᵢ in L])
+        uᵢ = L[max_volume_index].u
+        # Solving the first stage model: P_k(ε)
+        #   minimize: f_1(x)
+        #       s.t.: f_i(x) <= u_i - δ
+        @assert k == 1
+        MOI.set(
+            model.inner,
+            MOI.ObjectiveFunction{typeof(scalars[k])}(),
+            scalars[k],
+        )
+        ε_constraints = Any[]
+        for (i, f_i) in enumerate(scalars)
+            if i == k
+                continue
+            end
+            ci = MOI.Utilities.normalize_and_add_constraint(
+                model.inner,
+                f_i,
+                MOI.LessThan{Float64}(uᵢ[i-1] - δ),
+            )
+            push!(ε_constraints, ci)
+        end
+        optimize_inner!(model)
+        if !_is_scalar_status_optimal(model)
+            # If this fails, it likely means that the solver experienced a
+            # numerical error with this box. Just skip it.
+            _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
+            MOI.delete.(model, ε_constraints)
+            # continue
+            return
+        end
+        zₖ = MOI.get(model.inner, MOI.ObjectiveValue())
+        # Solving the second stage model: Q_k(ε, zₖ)
+        # Set objective sum(model.f)
+        sum_f = MOI.Utilities.operate(+, Float64, scalars...)
+        MOI.set(model.inner, MOI.ObjectiveFunction{typeof(sum_f)}(), sum_f)
+        # Constraint to eliminate weak dominance
+        zₖ_constraint = MOI.Utilities.normalize_and_add_constraint(
+            model.inner,
+            scalars[k],
+            MOI.EqualTo(zₖ),
+        )
+        optimize_inner!(model)
+        if !_is_scalar_status_optimal(model)
+            # If this fails, it likely means that the solver experienced a
+            # numerical error with this box. Just skip it.
+            MOI.delete.(model, ε_constraints)
+            MOI.delete(model, zₖ_constraint)
+            _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
+            # continue
+            return
+        end
+        X, Y = _compute_point(model, variables, model.f)
+        Y_proj = _project(Y, k)
+        if !(Y in YN)
+            push!(solutions, SolutionPoint(X, Y))
+            push!(YN, Y)
+            L = _update_list(L, Y_proj)
+        end
+        _remove_RectangleParallel(L, _RectangleParallel(Y_proj, uᵢ))
+        MOI.delete.(model, ε_constraints)
+        MOI.delete(model, zₖ_constraint)
+        #endregion
 end

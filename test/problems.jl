@@ -60,7 +60,8 @@ function test_problem_knapsack_min_p3(model)
         [1, 1, 1, 1, 1, 0, 0, 0, 1, 0] => [-2706, -3857, -3304],
         [1, 0, 1, 1, 1, 0, 0, 1, 1, 0] => [-2518, -3866, -3191],
     ]
-    @assert MOI.get(model, MOI.ResultCount()) == length(results)
+
+     @assert MOI.get(model, MOI.ResultCount()) == length(results)
     for i in 1:length(results)
         X = MOI.get(model, MOI.VariablePrimal(i), x)
         Y = MOI.get(model, MOI.ObjectiveValue(i))
