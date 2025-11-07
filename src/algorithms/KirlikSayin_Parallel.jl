@@ -134,7 +134,7 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
     _distribute_info_to_workers!(parallel_info)
 
     # Ideal and Nadir point estimation
-    results = Distributed.pmap(i -> begin 
+    results = Distributed.pmap(i -> begin  
         # println("Computing ideal and nadir point for objective ", i)
         res = process_ideal_nadir_point(i, yI, yN, sharedIdealPoint)
         # println("Finished ideal and nadir point for objective ", i)
@@ -143,7 +143,9 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
     
     # Check for errors during ideal/nadir point computation
     if any(r -> typeof(r) !== Int64, results)
-        return findfirst(r -> typeof(r) !== Int64, results)
+        res = filter(r -> typeof(r) !== Int64, results)[1]
+        println("Error during ideal/nadir point computation. Status: ", res[1])
+        return res
     end
     
     # updating the model info
@@ -163,20 +165,16 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
         selected_boxes = L[selected_volumes_idx]
         
         old_L_length = length(L)
-        #The parallel distributor
-        futures = Vector{Distributed.Future}(undef, length(selected_boxes))
-        for (idx, box) in enumerate(selected_boxes)
-            futures[idx] = Distributed.@spawnat Distributed.workers()[idx] begin
-                # println("\nStarted working on box:", box)
-                res = process_box(box)
-                # println("Finished working on box:", box)
-                return res
-            end
-        end
+        results = Distributed.pmap(box -> begin
+            # println("\nStarted working on box:", box)
+            res = process_box(box)
+            # println("Finished working on box:", box)
+            return res
+        end, selected_boxes)
         @assert length(L) == old_L_length "Length of L changed during parallel processing!"
 
-        all_res = fetch.(futures)
-        for res in all_res
+        # all_res = fetch.(futures)
+        for res in results
             if res.should_remove
                 _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), res.box.u))
             else

@@ -170,7 +170,9 @@ function copy(model::Optimizer)::Optimizer
     new_model.subproblem_count = model.subproblem_count
 
     MOI.set(new_model, MOI.TimeLimitSec(), model.time_limit_sec)
-    MOI.set(new_model, MOI.Silent(), true)
+    if MOI.supports(new_model, MOI.Silent())
+        MOI.set(new_model, MOI.Silent(), true)
+    end
     return new_model
 end
     
