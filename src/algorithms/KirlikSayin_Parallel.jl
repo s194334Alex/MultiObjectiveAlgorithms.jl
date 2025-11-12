@@ -166,7 +166,7 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
         selected_boxes = L[selected_volumes_idx]
         
         old_L_length = length(L)
-        @info "Starting parallel box processing for ", length(selected_boxes), " boxes. Total boxes: $(length(L))"
+        @info "Starting parallel box processing for $(length(selected_boxes)) boxes. Total boxes: $(length(L))"
         results = Distributed.pmap(box -> begin
             @info "\nStarted working on box: $box"
             res = process_box(box)
