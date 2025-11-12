@@ -135,9 +135,9 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
 
     # Ideal and Nadir point estimation
     results = Distributed.pmap(i -> begin  
-        println("Computing ideal and nadir point for objective ", i)
+        @info "Computing ideal and nadir point for objective $i"
         res = process_ideal_nadir_point(i, yI, yN, sharedIdealPoint)
-        println("Finished ideal and nadir point for objective ", i)
+        @info "Finished ideal and nadir point for objective $i"
         return res
     end, 1:n)
     
@@ -166,11 +166,11 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
         selected_boxes = L[selected_volumes_idx]
         
         old_L_length = length(L)
-        println("Starting parallel box processing for ", length(selected_boxes), " boxes. Total boxes: ", length(L))
+        @info "Starting parallel box processing for ", length(selected_boxes), " boxes. Total boxes: $(length(L))"
         results = Distributed.pmap(box -> begin
-            println("\nStarted working on box:", box)
+            @info "\nStarted working on box: $box"
             res = process_box(box)
-            println("Finished working on box:", box)
+            @info "Finished working on box: $box"
             return res
         end, selected_boxes)
         @assert length(L) == old_L_length "Length of L changed during parallel processing!"
@@ -197,7 +197,7 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
             status = filter(r -> r.status != MOI.OPTIMAL, results)[1].status
         end
     end
-    println("Box processing complete. Number of solutions found: ", length(solutions))
+    @info "Box processing complete. Number of solutions found: $(length(solutions))"
     return status, filter_nondominated(MOI.MIN_SENSE, solutions)
 end
 
