@@ -134,12 +134,14 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
     _distribute_info_to_workers!(parallel_info)
 
     # Ideal and Nadir point estimation
+    @info "Starting ideal and nadir point computation"
     results = Distributed.pmap(i -> begin  
-        @info "Computing ideal and nadir point for objective $i"
+        # @info "Computing ideal and nadir point for objective $i"
         res = process_ideal_nadir_point(i, yI, yN, sharedIdealPoint)
-        @info "Finished ideal and nadir point for objective $i"
+        # @info "Finished ideal and nadir point for objective $i"
         return res
     end, 1:n)
+    @info "Finished ideal and nadir point computation"
     
     model.subproblem_count += sum(r -> r.subproblems_added, results)
 
@@ -168,9 +170,9 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
         old_L_length = length(L)
         @info "Starting parallel box processing for $(length(selected_boxes)) boxes. Total boxes: $(length(L))"
         results = Distributed.pmap(box -> begin
-            @info "\nStarted working on box: $box"
+            # @info "\nStarted working on box: $box"
             res = process_box(box)
-            @info "Finished working on box: $box"
+            # @info "Finished working on box: $box"
             return res
         end, selected_boxes)
         @assert length(L) == old_L_length "Length of L changed during parallel processing!"
