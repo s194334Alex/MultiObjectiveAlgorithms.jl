@@ -620,6 +620,7 @@ it also increments the `subproblem_count`.
 function optimize_inner!(model::Optimizer)
     MOI.optimize!(model.inner)
     model.subproblem_count += 1
+    # println("optimizer_inner!: added one subproblem")
     return
 end
 

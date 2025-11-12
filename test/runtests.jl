@@ -16,7 +16,7 @@ using Test
 # end
 
 @testset "$file" for file in readdir(joinpath(@__DIR__, "algorithms"))
-    if occursin("Parallel.jl", file)
+    if occursin("KirlikSayin", file)
         include(joinpath(@__DIR__, "algorithms", file))
     end 
 end

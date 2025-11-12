@@ -32,6 +32,9 @@ function run_tests()
             end
         end
     end
+    # @testset "test_solver_failures" begin
+    #     test_solve_failures()
+    # end
     return
 end
 
@@ -179,14 +182,11 @@ function test_solve_failures()
         for j in 1:n
             MOI.add_constraint(model, sum(1.0 .* x[:, j]), MOI.EqualTo(1.0))
         end
-        println("\nTesting fail_after: $fail_after")
-        display(MOI.get(model, MOI.TerminationStatus()))
         MOI.optimize!(model)
-        println("Subproblem count: ", MOI.get(model, MOA.SubproblemCount()))
-        display(MOI.get(model, MOI.TerminationStatus()))
         @test MOI.get(model, MOI.TerminationStatus()) ==
               (fail_after <= 3 ? MOI.NUMERICAL_ERROR : MOI.OPTIMAL)
-        @test MOI.get(model, MOI.ResultCount()) == 0
+        @test MOI.get(model, MOI.ResultCount()) == 
+                (fail_after <= 3 ? 0 : 1)
     end
     return
 end

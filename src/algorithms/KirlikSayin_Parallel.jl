@@ -141,15 +141,16 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
         return res
     end, 1:n)
     
+    model.subproblem_count += sum(r -> r.subproblems_added, results)
+
     # Check for errors during ideal/nadir point computation
-    if any(r -> typeof(r) !== Int64, results)
-        res = filter(r -> typeof(r) !== Int64, results)[1]
-        println("Error during ideal/nadir point computation. Status: ", res[1])
-        return res
+    if any(r -> r.status != MOI.OPTIMAL, results)
+        res = filter(r -> r.status != MOI.OPTIMAL, results)[1]
+        # println("Error during ideal/nadir point computation. Status: ", res.status)
+        return res.status, nothing
     end
-    
+
     # updating the model info
-    model.subproblem_count += sum(results)
     model.ideal_point = collect(sharedIdealPoint)
     
     L = [_RectangleParallel(_project(yI, k), _project(yN, k))]
@@ -187,21 +188,36 @@ function minimize_multiobjective!(algorithm::KirlikSayinParallel, model::Optimiz
             end  
 
             # Update subproblem count
-            model.subproblem_count += res.subproblems_solver         
+            model.subproblem_count += res.subproblems_increase   
+        end
+        
+        # change status if no solutions found and L is empty
+        if isempty(L) && length(solutions) == 0
+            status = filter(r -> r.status != MOI.OPTIMAL, results)[1].status
         end
     end
+    # println("Box processing complete. Number of solutions found: ", length(solutions))
     return status, filter_nondominated(MOI.MIN_SENSE, solutions)
 end
 
-function process_ideal_nadir_point(i::Int, yI::SharedArrays.SharedVector{Float64}, yN::SharedArrays.SharedVector{Float64}, sharedIdealPoint::SharedArrays.SharedVector{Float64})
+
+struct IdealNadirProcessResult
+    status::MOI.TerminationStatusCode
+    ideal_point::Float64
+    nadir_point::Float64
+    subproblems_added::Int64
+end
+function process_ideal_nadir_point(i::Int, yI::SharedArrays.SharedVector{Float64}, yN::SharedArrays.SharedVector{Float64}, sharedIdealPoint::SharedArrays.SharedVector{Float64})::IdealNadirProcessResult
+    # Rebuild local model to avoid conflicts
     f_i = SCALARS[i]
-   
+    old_subproblem_count = LOCAL_MODEL.subproblem_count
     # Ideal point
     MOI.set(LOCAL_MODEL.inner, MOI.ObjectiveFunction{typeof(f_i)}(), f_i)
     optimize_inner!(LOCAL_MODEL)
     status = MOI.get(LOCAL_MODEL.inner, MOI.TerminationStatus())
     if !_is_scalar_status_optimal(status)
-        return status, nothing
+        return IdealNadirProcessResult(status, NaN, NaN, LOCAL_MODEL.subproblem_count - old_subproblem_count)
+        # return status, nothing
     end
     _, Y = _compute_point(LOCAL_MODEL, VARIABLES, f_i)
     sharedIdealPoint[i] = yI[i] = Y
@@ -214,13 +230,14 @@ function process_ideal_nadir_point(i::Int, yI::SharedArrays.SharedVector{Float64
         # Repair ObjectiveSense before exiting
         MOI.set(LOCAL_MODEL.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
         _warn_on_nonfinite_anti_ideal(ALGO, MOI.MIN_SENSE, i)
-        return status, nothing
+        return IdealNadirProcessResult(status, NaN, NaN, LOCAL_MODEL.subproblem_count - old_subproblem_count)
+        # return status, nothing
     end
 
     _, Y = _compute_point(LOCAL_MODEL, VARIABLES, f_i)
     yN[i] = Y + δ
     MOI.set(LOCAL_MODEL.inner, MOI.ObjectiveSense(), MOI.MIN_SENSE)
-    return LOCAL_MODEL.subproblem_count
+    return IdealNadirProcessResult(status, yI[i], yN[i], LOCAL_MODEL.subproblem_count - old_subproblem_count)
 end
 
 struct BoxProcessResult
@@ -229,7 +246,8 @@ struct BoxProcessResult
     Y::Union{Vector{Float64}, Nothing}
     Y_proj::Union{Vector{Float64}, Nothing}
     box::_RectangleParallel
-    subproblems_solver::Int64
+    subproblems_increase::Int64
+    status::MOI.TerminationStatusCode
 end
 
 function process_box(box::_RectangleParallel)::BoxProcessResult
@@ -255,13 +273,15 @@ function process_box(box::_RectangleParallel)::BoxProcessResult
         )
         push!(ε_constraints, ci)
     end
+    old_subproblem_count = LOCAL_MODEL.subproblem_count
     optimize_inner!(LOCAL_MODEL)
     if !_is_scalar_status_optimal(LOCAL_MODEL)
         # If this fails, it likely means that the solver experienced a
         # numerical error with this box. Just skip it.
         # _remove_RectangleParallel(L, _RectangleParallel(_project(yI, K), uᵢ))
         MOI.delete.(LOCAL_MODEL, ε_constraints)
-        return BoxProcessResult(true, nothing, nothing, nothing, box, LOCAL_MODEL.subproblem_count)
+        # println("First stage optimization failed with status: ", MOI.get(LOCAL_MODEL.inner, MOI.TerminationStatus()))
+        return BoxProcessResult(true, nothing, nothing, nothing, box, LOCAL_MODEL.subproblem_count - old_subproblem_count, MOI.get(LOCAL_MODEL.inner, MOI.TerminationStatus()))
     end
     zₖ = MOI.get(LOCAL_MODEL.inner, MOI.ObjectiveValue())
     # Solving the second stage model: Q_k(ε, zₖ)
@@ -281,14 +301,15 @@ function process_box(box::_RectangleParallel)::BoxProcessResult
         MOI.delete.(LOCAL_MODEL, ε_constraints)
         MOI.delete(LOCAL_MODEL, zₖ_constraint)
         # _remove_RectangleParallel(L, _RectangleParallel(_project(yI, k), uᵢ))
-        return BoxProcessResult(true, nothing, nothing, nothing, box, LOCAL_MODEL.subproblem_count)
+        # println("Second stage optimization failed with status: ", MOI.get(LOCAL_MODEL.inner, MOI.TerminationStatus()))
+        return BoxProcessResult(true, nothing, nothing, nothing, box, LOCAL_MODEL.subproblem_count - old_subproblem_count, MOI.get(LOCAL_MODEL.inner, MOI.TerminationStatus()))
     end
     X, Y = _compute_point(LOCAL_MODEL, VARIABLES, LOCAL_MODEL.f)
     Y_proj = _project(Y, K)
     #  _remove_RectangleParallel(L, _RectangleParallel(Y_proj, uᵢ))
     MOI.delete.(LOCAL_MODEL, ε_constraints)
     MOI.delete(LOCAL_MODEL, zₖ_constraint)
-    return BoxProcessResult(false, X, Y, Y_proj, box, LOCAL_MODEL.subproblem_count)
+    return BoxProcessResult(false, X, Y, Y_proj, box, LOCAL_MODEL.subproblem_count - old_subproblem_count, MOI.get(LOCAL_MODEL.inner, MOI.TerminationStatus()))
 end
 
 function old_code()
