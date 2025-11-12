@@ -138,6 +138,8 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
     compute_ideal_point::Bool
     subproblem_count::Int
     optimizer_factory::Any
+    silent::Union{Nothing,Bool}
+    threads::Union{Nothing,Int}
 
     function Optimizer(optimizer_factory)
         return new(
@@ -169,10 +171,16 @@ function copy(model::Optimizer)::Optimizer
     new_model.compute_ideal_point = model.compute_ideal_point
     new_model.subproblem_count = model.subproblem_count
 
-    MOI.set(new_model, MOI.TimeLimitSec(), model.time_limit_sec)
-    if MOI.supports(new_model, MOI.Silent())
-        MOI.set(new_model, MOI.Silent(), true)
+    if model.time_limit_sec !== nothing
+        MOI.set(new_model, MOI.TimeLimitSec(), model.time_limit_sec)
     end
+    if model.silent !== nothing
+        MOI.set(new_model, MOI.Silent(), model.silent)
+    end
+    if model.threads !== nothing
+        MOI.set(new_model, MOI.NumberOfThreads(), model.threads)
+    end
+
     return new_model
 end
     
@@ -219,6 +227,36 @@ end
 function MOI.set(model::Optimizer, ::MOI.TimeLimitSec, ::Nothing)
     model.time_limit_sec = nothing
     return
+end
+
+### Silent
+function MOI.supports(model::Optimizer, ::MOI.Silent)
+    return MOI.supports(model.inner, MOI.Silent())
+end
+
+function MOI.set(model::Optimizer, ::MOI.Silent, value::Bool)
+    model.silent = value
+    MOI.set(model.inner, MOI.Silent(), value)
+    return
+end
+
+function MOI.get(model::Optimizer, ::MOI.Silent)
+    return model.silent
+end
+
+### Threads
+function MOI.supports(model::Optimizer, ::MOI.NumberOfThreads)
+    return MOI.supports(model.inner, MOI.NumberOfThreads())
+end
+
+function MOI.set(model::Optimizer, ::MOI.NumberOfThreads, value::Int)
+    model.threads = value
+    MOI.set(model.inner, MOI.NumberOfThreads(), value)
+    return
+end
+
+function MOI.get(model::Optimizer, ::MOI.NumberOfThreads)
+    return model.threads
 end
 
 ### SolveTimeSec
