@@ -159,7 +159,11 @@ mutable struct Optimizer <: MOI.AbstractOptimizer
 end
 
 function copy(model::Optimizer)::Optimizer
-    new_model = Optimizer(model.optimizer_factory)
+    if model.optimizer_factory == Gurobi.Optimizer
+        new_model = Gurobi.Optimizer(Gurobi.Env())
+    else
+        new_model = Optimizer(model.optimizer_factory)
+    end
     MOI.copy_to(new_model, model)
     new_model.algorithm = model.algorithm
     new_model.f = model.f
